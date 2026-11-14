@@ -367,6 +367,30 @@ pages.investments = async () => {
   const m = state.month;
   const [sum, hist] = await Promise.all([api('/investments/summary'), api(`/investments/history?months=24&end=${m}`)]);
   const all = await api('/accounts');
+  // statement of one account: every deposit, withdrawal and recorded value, newest first
+  const stId = all.some((a) => a.id == pages.investments.stmt) ? pages.investments.stmt : null;
+  const [stFlows, stVals] = stId ? await Promise.all([api(`/accounts/${stId}/flows`), api(`/accounts/${stId}/valuations`)]) : [[], []];
+  let stmtCard = '';
+  if (stId) {
+    const a = all.find((x) => x.id == stId);
+    const entries = [...stFlows.map((f) => ({ ...f, kind: 'flow' })), ...stVals.map((v) => ({ ...v, kind: 'val' }))]
+      .sort((x, y) => x.date.localeCompare(y.date) || (x.kind === y.kind ? x.id - y.id : x.kind === 'flow' ? -1 : 1));
+    let run = 0;
+    entries.forEach((e) => { if (e.kind === 'flow') run += e.amount; e.run = run; });
+    const sRows = entries.reverse().map((e) => (e.kind === 'flow'
+      ? `<tr><td>${e.date}</td><td><span class="tag ${e.amount >= 0 ? 'ok' : 'bad'}">${e.amount >= 0 ? 'Deposit' : 'Withdrawal'}</span></td><td>${esc(e.note)}</td>
+        <td class="num ${signCls(e.amount)}">${e.amount > 0 ? '+' : ''}${nf.format(e.amount)}</td><td class="num">${nf.format(e.run)}</td><td class="num"></td>
+        <td class="actions">${btn('del-flow', 'Delete', e.id, 'small ghost danger')}</td></tr>`
+      : `<tr><td>${e.date}</td><td><span class="tag">Value recorded</span></td><td></td><td class="num"></td><td class="num">${nf.format(e.run)}</td>
+        <td class="num">${nf.format(e.value)}${stFlows.length ? ` <span class="${signCls(e.value - e.run)}">(${e.value - e.run > 0 ? '+' : ''}${nf.format(e.value - e.run)})</span>` : ''}</td>
+        <td class="actions">${btn('del-val', 'Delete', e.id, 'small ghost danger')}</td></tr>`));
+    const dep = stFlows.filter((f) => f.amount > 0).reduce((t, f) => t + f.amount, 0);
+    const wd = stFlows.filter((f) => f.amount < 0).reduce((t, f) => t - f.amount, 0);
+    stmtCard = `<div style="height:14px"></div><div id="stmt">${card(`Statement · ${esc(a.name)}`,
+      table(['Date', 'Entry', 'Note', `#Amount ${a.currency}`, '#Paid in so far', '#Account value (gain)', ''], sRows, 'Nothing recorded for this account yet.'),
+      btn('stmt-close', 'Close statement'),
+      `Deposited ${money(dep, a.currency)} · Withdrawn ${money(wd, a.currency)} · Net paid in ${money(dep - wd, a.currency)} · Latest value ${money(a.value, a.currency)}`)}</div>`;
+  }
   // start the charts at the first month that has any data
   const first = hist.months.findIndex((_, i) => hist.accounts.some((a) => a.value_chf[i] != null));
   if (first > 0) {
@@ -388,7 +412,7 @@ pages.investments = async () => {
     <td class="num">${a.gain_chf != null ? nf.format(a.net_invested_chf) : '–'}</td>
     <td class="num ${signCls(a.gain_chf)}">${a.gain_chf != null ? `${a.gain_chf > 0 ? '+' : ''}${nf.format(a.gain_chf)}` : '–'}</td>
     <td class="num ${signCls(a.return_pct)}">${pct(a.return_pct)}</td><td>${a.latest_date || '–'}</td>
-    <td class="actions">${btn('val', 'Update value', a.id)}${btn('flow', 'Deposit / withdraw', a.id)}${btn('edit', 'Edit', a.id, 'small ghost')}${btn('toggle', a.active ? 'Close' : 'Reopen', a.id, 'small ghost')}</td></tr>`);
+    <td class="actions">${btn('stmt', 'Statement', a.id)}${btn('val', 'Update value', a.id)}${btn('flow', 'Deposit / withdraw', a.id)}${btn('edit', 'Edit', a.id, 'small ghost')}${btn('toggle', a.active ? 'Close' : 'Reopen', a.id, 'small ghost')}</td></tr>`);
   $('#view').innerHTML = `
     <div class="grid kpis">
       ${kpi('Total value', kpiVal(sum.total_value_chf), Object.entries(sum.by_type_chf).map(([t, v]) => `${typeLabel[t]} ${nf0.format(v)}`).join(' · ') || 'No accounts yet')}
@@ -401,7 +425,7 @@ pages.investments = async () => {
       ${card('Performance', tracked.length ? '<div class="chart"><canvas id="c2"></canvas></div>' : '<div class="empty">Record deposits on an account to compare its value with the money paid in.</div>',
         `<select id="acc">${tracked.map((a) => `<option value="${a.account_id}" ${a.account_id == sel ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select>`, 'Value vs money paid in, CHF')}
     </div>
-    ${card('Accounts', table(['Account', 'Type', 'Owner', '#Value CHF', '#Paid in', '#Gain', '#Return', 'As of', ''], rows, 'No accounts yet — add your emergency cash, savings and stock accounts.'), btn('add', '+ Add account', '', 'primary'), 'Gain and return appear once deposits are recorded for an account')}`;
+    ${card('Accounts', table(['Account', 'Type', 'Owner', '#Value CHF', '#Paid in', '#Gain', '#Return', 'As of', ''], rows, 'No accounts yet — add your emergency cash, savings and stock accounts.'), btn('add', '+ Add account', '', 'primary'), 'Gain and return appear once deposits are recorded for an account')}${stmtCard}`;
   const labels = hist.months.map((x) => monthLabel(x));
   if (hist.accounts.length) {
     const sets = foldSeries(hist.accounts.map((a) => ({ label: a.name, a })), (it) => it.a.value_chf.map((v) => v ?? 0));
@@ -414,6 +438,10 @@ pages.investments = async () => {
   }
   const acc = (id) => all.find((a) => a.id == id);
   actions = {
+    stmt: async (id) => { pages.investments.stmt = id; await render(); document.getElementById('stmt')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); },
+    'stmt-close': () => { pages.investments.stmt = null; render(); },
+    'del-flow': (id) => confirmDelete(`/flows/${id}`, 'this deposit / withdrawal'),
+    'del-val': (id) => confirmDelete(`/valuations/${id}`, 'this recorded value'),
     add: () => openForm('Add account', fields(), (v) => api('/accounts', { method: 'POST', json: v })),
     edit: (id) => openForm('Edit account', fields(acc(id)), (v) => api(`/accounts/${id}`, { method: 'PATCH', json: v })),
     toggle: async (id) => { await api(`/accounts/${id}`, { method: 'PATCH', json: { active: !acc(id).active } }); render(); },

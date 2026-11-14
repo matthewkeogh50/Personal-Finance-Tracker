@@ -84,7 +84,7 @@ keeps a local SQLite file instead.
 - **Salary** — both salaries by month and by year.
 - **Expenses** — the month's transactions, category trend, uploaded bank screenshots. **Pull UK expenses** turns the month's GBP expenses into one CHF line at today's rate plus 10 % for transfer (Wise) fees.
 - **Recurring** — rent, car payment, etc.: paid / not paid for the month.
-- **Investments** — accounts, value over time, gain and return vs money paid in.
+- **Investments** — accounts, value over time, gain and return vs money paid in. **Statement** on an account lists every deposit, withdrawal (with its note) and recorded value.
 - **GBP** — UK spending in pounds and CHF, exchange-rate history.
 - **Settings** — names, categories, links for the agent.
 
