@@ -75,14 +75,14 @@ keeps a local SQLite file instead.
 | `DYNAMODB_TABLE` | `household-finance` | Table name. |
 | `DYNAMODB_CREATE_TABLE` | `true` | Create the table on first start if it is missing. |
 | `API_KEY` | empty | If set, every API call needs the `X-API-Key` header; the dashboard asks for it once. |
-| `FX_AUTO_FETCH` | `true` | Fetch missing GBP→CHF rates from frankfurter.dev (ECB rates). Only a currency and date are sent. |
+| `FX_AUTO_FETCH` | `true` | Fetch exchange rates from frankfurter.dev (ECB rates): the day's rate for GBP and any other foreign currency in use is stored automatically at start and every 6 hours, and missing past rates are looked up when needed. Only a currency and date are sent. A rate you set by hand for a day is never overwritten. |
 | `DASHBOARD_PORT` / `API_PORT` | `1113` / `1311` | Ports inside the container. |
 
 ## Screens
 
 - **Overview** — income, spending, left over, net worth; income vs expenses and net worth over time; budgets; what to send to savings.
 - **Salary** — both salaries by month and by year.
-- **Expenses** — the month's transactions, category trend, uploaded bank screenshots.
+- **Expenses** — the month's transactions, category trend, uploaded bank screenshots. **Pull UK expenses** turns the month's GBP expenses into one CHF line at today's rate plus 10 % for transfer (Wise) fees.
 - **Budgets** — budget vs spent per category, with history.
 - **Recurring** — rent, car payment, etc.: paid / not paid for the month.
 - **Investments** — accounts, value over time, gain and return vs money paid in.

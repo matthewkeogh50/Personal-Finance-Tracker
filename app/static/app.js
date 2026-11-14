@@ -165,7 +165,7 @@ function txFields(t = {}) {
   ];
 }
 function txRows(list, showCur) {
-  return list.map((t) => `<tr><td>${t.date}</td><td>${esc(t.description)}${t.recurring ? ' <span class="tag">recurring</span>' : ''}${t.note ? `<div class="sub" style="color:var(--muted);font-size:12px">${esc(t.note)}</div>` : ''}</td>
+  return list.map((t) => `<tr><td>${t.date}</td><td>${esc(t.description)}${t.recurring ? ' <span class="tag">recurring</span>' : ''}${t.is_rollup ? ' <span class="tag ok">pulled from GBP</span>' : ''}${t.rollup_id ? ' <span class="tag">in UK expenses</span>' : ''}${t.note ? `<div class="sub" style="color:var(--muted);font-size:12px">${esc(t.note)}</div>` : ''}</td>
     <td>${t.category ? `<span class="tag">${esc(t.category)}</span>` : '<span class="tag bad">uncategorised</span>'}</td>
     ${showCur ? `<td class="num">${money(t.amount, t.currency)}</td>` : ''}
     <td class="num">${t.currency !== 'CHF' && !showCur ? `<span class="tag">${money(t.amount, t.currency)}</span> ` : ''}${nf.format(t.amount_chf)}</td>
@@ -269,11 +269,12 @@ pages.expenses = async () => {
   const f = pages.expenses.filter || (pages.expenses.filter = { cat: '', q: '' });
   const key = localStorage.getItem('apiKey');
   const stRows = stmts.map((s) => `<tr><td><a href="/api/statements/${s.id}/file${key ? `?api_key=${encodeURIComponent(key)}` : ''}" target="_blank">${esc(s.filename)}</a></td><td>${esc(s.note)}</td><td class="num">${s.transactions} transactions</td><td>${s.uploaded_at.slice(0, 10)}</td><td class="actions">${btn('del-st', 'Delete', s.id, 'small ghost danger')}</td></tr>`);
+  const pulled = txs.filter((t) => t.rollup_id).length;
   const draw = () => {
     const q = f.q.toLowerCase();
-    const list = txs.filter((t) => (f.cat === '' || (f.cat === 'none' ? t.category_id == null : t.category_id == f.cat)) && (!q || `${t.description} ${t.note || ''}`.toLowerCase().includes(q)));
+    const list = txs.filter((t) => !t.rollup_id && (f.cat === '' || (f.cat === 'none' ? t.category_id == null : t.category_id == f.cat)) && (!q || `${t.description} ${t.note || ''}`.toLowerCase().includes(q)));
     $('#txtable').innerHTML = table(['Date', 'Description', 'Category', '#CHF', ''], txRows(list), 'No expenses match.') +
-      (list.length ? `<div class="sub" style="color:var(--muted);margin-top:8px">${list.length} transactions · ${money(list.reduce((s, t) => s + t.amount_chf, 0))}</div>` : '');
+      (list.length ? `<div class="sub" style="color:var(--muted);margin-top:8px">${list.length} transactions · ${money(list.reduce((s, t) => s + t.amount_chf, 0))}${pulled ? ` · ${pulled} GBP expenses are inside the “UK expenses” line (<a href="#/gbp">see them</a>)` : ''}</div>` : '');
   };
   $('#view').innerHTML = `
     <div class="grid kpis">
@@ -289,6 +290,7 @@ pages.expenses = async () => {
     ${card(`Expenses in ${monthLabel(m, true)}`, '<div id="txtable"></div>', `
       <input type="search" id="fq" placeholder="Search…" value="${esc(f.q)}">
       <select id="fcat"><option value="">All categories</option><option value="none">Uncategorised</option>${state.categories.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select>
+      ${btn('pull-uk', 'Pull UK expenses', '', '')}
       ${btn('add-tx', '+ Add expense', '', 'primary')}`)}
     <div style="height:14px"></div>
     ${card('Bank screenshots / statements', table(['File', 'Note', '#Linked', 'Uploaded', ''], stRows, 'No screenshots uploaded for this month.'), btn('add-st', 'Upload', '', ''), 'Source documents the agent uploaded for this month')}`;
@@ -305,6 +307,15 @@ pages.expenses = async () => {
       return api('/statements', { method: 'POST', body: fd });
     }, 'Upload'),
     'del-st': (id) => confirmDelete(`/statements/${id}`, 'this file'),
+    'pull-uk': async () => {
+      const p = await api(`/transactions/rollup?month=${m}&currency=GBP`);
+      if (!p.transactions) { toast(`No GBP expenses in ${monthLabel(m, true)}.`); return; }
+      openForm(`Pull UK expenses · ${money(p.total, 'GBP')} (${p.transactions} expenses)`, [
+        { name: 'fx_rate', label: "CHF per 1 GBP (today's rate — change it to match Wise if you like)", type: 'number', step: '0.0001', value: p.rate, required: true },
+        { name: 'fee_pct', label: 'Added on top for Wise fees (%)', type: 'number', step: '0.1', value: p.fee_pct, required: true },
+      ], (v) => api('/transactions/rollup', { method: 'POST', json: { ...v, month: m, currency: 'GBP' } }),
+      p.existing ? `Replace the existing line (${money(p.existing.amount_chf)})` : 'Add “UK expenses” line');
+    },
   };
 };
 

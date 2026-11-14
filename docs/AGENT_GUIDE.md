@@ -25,6 +25,14 @@ Use `127.0.0.1` rather than `localhost` when calling from the same Windows machi
   an automatically fetched ECB rate → the nearest stored rate. If none exists you get `422`; then
   either pass `fx_rate` or store one with `PUT /api/fx`. If the bank shows the CHF amount actually
   charged, pass `fx_rate = chf_charged / gbp_amount` so the numbers match the bank exactly.
+- **Today's rate is stored automatically** (at start and every 6 hours) unless the server runs with
+  `FX_AUTO_FETCH=false`. A rate set with `PUT /api/fx` for a day is never overwritten.
+- **"UK expenses" line.** `POST /transactions/rollup` pulls a month's GBP expenses into one CHF
+  expense: GBP total × today's rate × 1.10 (10 % for Wise transfer fees; override with `fee_pct` /
+  `fx_rate`). The GBP rows then carry `rollup_id` and stop counting towards CHF totals, budgets and
+  category reports — the single line (category *UK expenses*) counts instead. They still appear in
+  `/reports/foreign` and `expenses.foreign_currency`. Calling it again replaces the line; deleting
+  the line restores the individual rows. Only do this when the humans ask for it.
 - **Dates** are `YYYY-MM-DD`; **months** are `YYYY-MM`. A transaction belongs to the month of its `date`.
 - **Expense sign:** positive `amount` = money spent; negative = refund.
 - **Names instead of ids.** Wherever `category_id` or `person_id` is accepted you may send
@@ -133,6 +141,8 @@ curl -F "file=@oct.png" -F "month=2026-10" http://127.0.0.1:1311/api/statements
 | GET | `/transactions` | `?month=&date_from=&date_to=&category_id=&uncategorised=true&currency=&recurring_id=&statement_id=&q=&limit=` | List / search |
 | POST | `/transactions` | `date`, `description`, `amount`, `currency?`, `fx_rate?`, `category_id` or `category`, `person_id` or `person`, `recurring_id?`, `statement_id?`, `account?`, `note?` | Record one expense |
 | POST | `/transactions/bulk` | `transactions: [...]`, `statement_id?`, `skip_duplicates?` (default true) | Record many (all-or-nothing) |
+| GET | `/transactions/rollup` | `?month=&currency=GBP` | Preview the pull: GBP total, today's rate, CHF result, existing line |
+| POST | `/transactions/rollup` | `month?`, `currency?` (GBP), `fx_rate?` (default today's), `fee_pct?` (default 10), `date?` | Pull the month's GBP expenses into one CHF line "UK expenses" (replaces an earlier one) |
 | PATCH | `/transactions/{id}` | any field | Correct / re-categorise |
 | DELETE | `/transactions/{id}` | | Remove |
 

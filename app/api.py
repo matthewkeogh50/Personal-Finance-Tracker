@@ -1,4 +1,5 @@
 """All REST endpoints. Mounted under /api on both the API port and the dashboard port."""
+import calendar
 import os
 import sqlite3
 import uuid
@@ -22,6 +23,7 @@ DATE = r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$"
 MONTH = r"^\d{4}-(0[1-9]|1[0-2])$"
 CUR = r"^[A-Z]{3}$"
 DB = Depends(dbm.get_db)
+DEFAULT_TRANSFER_FEE_PCT = 10.0     # added when foreign expenses are pulled into one CHF line (Wise fees)
 
 
 def require_key(x_api_key: Optional[str] = Header(None), api_key: Optional[str] = Query(None)):
@@ -333,7 +335,7 @@ def budget_status(db, month: str) -> list[dict]:
     cats = rows(db.execute("SELECT id, name, archived FROM categories ORDER BY name"))
     spent = {r["category_id"]: r for r in db.execute(
         "SELECT category_id, SUM(amount_chf) AS spent, COUNT(*) AS n FROM transactions "
-        "WHERE substr(date,1,7)=? GROUP BY category_id", (month,))}
+        "WHERE substr(date,1,7)=? AND rollup_id IS NULL GROUP BY category_id", (month,))}
     out = []
     for c in cats:
         b = db.execute("SELECT amount FROM budgets WHERE category_id=? AND valid_from<=? "
@@ -496,7 +498,8 @@ class BulkIn(BaseModel):
                                                     "currency and description")
 
 
-TX_SELECT = ("SELECT t.*, c.name AS category, p.name AS person, r.name AS recurring FROM transactions t "
+TX_SELECT = ("SELECT t.*, c.name AS category, p.name AS person, r.name AS recurring, "
+             "EXISTS(SELECT 1 FROM transactions x WHERE x.rollup_id=t.id) AS is_rollup FROM transactions t "
              "LEFT JOIN categories c ON c.id=t.category_id LEFT JOIN people p ON p.id=t.person_id "
              "LEFT JOIN recurring r ON r.id=t.recurring_id")
 
@@ -579,6 +582,90 @@ def create_transactions_bulk(body: BulkIn, db=DB):
         out = rows(db.execute(f"{TX_SELECT} WHERE t.id IN ({marks}) ORDER BY t.date, t.id", created))
     return {"created_count": len(out), "skipped_duplicates_count": len(skipped),
             "total_created_chf": r2(sum(t["amount_chf"] for t in out)), "created": out, "skipped_duplicates": skipped}
+
+
+class RollupIn(BaseModel):
+    month: Optional[str] = Field(None, pattern=MONTH, description="Month to pull; default current month")
+    currency: str = Field("GBP", pattern=CUR)
+    fx_rate: Optional[float] = Field(None, gt=0, description="CHF per 1 unit; default is today's rate")
+    fee_pct: float = Field(DEFAULT_TRANSFER_FEE_PCT, ge=0, le=100,
+                           description="Added on top for transfer fees (Wise), in percent")
+    date: Optional[str] = Field(None, pattern=DATE, description="Date of the summary line; default today, "
+                                                                "or the last day of the month for a past month")
+
+
+def rollup_name(currency: str) -> str:
+    return "UK expenses" if currency == "GBP" else f"{currency} expenses"
+
+
+def rollup_state(db, month: str, currency: str) -> dict:
+    r = db.execute("SELECT COALESCE(SUM(amount),0) AS total, COUNT(*) AS n, "
+                   "COALESCE(SUM(rollup_id IS NULL),0) AS not_pulled FROM transactions "
+                   "WHERE currency=? AND substr(date,1,7)=?", (currency, month)).fetchone()
+    ids = [x[0] for x in db.execute("SELECT DISTINCT rollup_id FROM transactions WHERE currency=? "
+                                    "AND substr(date,1,7)=? AND rollup_id IS NOT NULL", (currency, month))]
+    return {"total": r2(r["total"]), "transactions": r["n"], "not_yet_pulled": r["not_pulled"], "line_ids": ids}
+
+
+@router.get("/transactions/rollup", tags=["transactions"])
+def preview_rollup(month: Optional[str] = Query(None, pattern=MONTH), currency: str = Query("GBP", pattern=CUR),
+                   db=DB):
+    """What POST /transactions/rollup would do for a month: the foreign total, today's rate, the default
+    fee and the resulting CHF amount, plus the summary line that already exists (if any)."""
+    month = month or this_month()
+    st = rollup_state(db, month, currency)
+    try:
+        rate = resolve_rate(db, currency, _date.today().isoformat())
+    except HTTPException:
+        rate = None
+    existing = one(db, f"{TX_SELECT} WHERE t.id=?", (st["line_ids"][0],)) if st["line_ids"] else None
+    return {"month": month, "currency": currency, "total": st["total"], "transactions": st["transactions"],
+            "not_yet_pulled": st["not_yet_pulled"], "rate": rate, "fee_pct": DEFAULT_TRANSFER_FEE_PCT,
+            "amount_chf": r2(st["total"] * rate * (1 + DEFAULT_TRANSFER_FEE_PCT / 100)) if rate else None,
+            "existing": existing}
+
+
+@router.post("/transactions/rollup", status_code=201, tags=["transactions"])
+def create_rollup(body: RollupIn = RollupIn(), db=DB):
+    """Pull a month's foreign-currency expenses (default GBP) into ONE CHF line called "UK expenses".
+
+    amount = total in the foreign currency x today's exchange rate x (1 + fee_pct/100). The fee
+    (default 10 %) covers what it costs to send the money abroad. The individual foreign expenses
+    stay on record (GBP screen, foreign reports) but no longer count towards CHF totals, so nothing
+    is counted twice. Calling it again for the same month replaces the line with a fresh one;
+    deleting the line puts the individual expenses back into the CHF totals.
+    """
+    if body.currency == BASE:
+        raise HTTPException(422, "Choose a foreign currency; CHF expenses need no conversion")
+    month = body.month or this_month()
+    st = rollup_state(db, month, body.currency)
+    if not st["transactions"]:
+        raise HTTPException(422, f"There are no {body.currency} expenses in {month}")
+    today = _date.today().isoformat()
+    rate = resolve_rate(db, body.currency, today, body.fx_rate)
+    if body.date:
+        if body.date[:7] != month:
+            raise HTTPException(422, f"date must be in {month}")
+        line_date = body.date
+    else:
+        y, m = int(month[:4]), int(month[5:7])
+        line_date = today if today[:7] == month else f"{month}-{calendar.monthrange(y, m)[1]:02d}"
+    name = rollup_name(body.currency)
+    cat = db.execute("SELECT id FROM categories WHERE name=? COLLATE NOCASE", (name,)).fetchone()
+    cid = cat["id"] if cat else db.execute("INSERT INTO categories (name) VALUES (?)", (name,)).lastrowid
+    if st["line_ids"]:
+        marks = ",".join("?" * len(st["line_ids"]))
+        db.execute(f"DELETE FROM transactions WHERE id IN ({marks})", st["line_ids"])
+    chf = round(st["total"] * rate * (1 + body.fee_pct / 100), 2)
+    note = (f"{body.currency} {st['total']:.2f} x {rate:.4f} + {body.fee_pct:g}% transfer fees "
+            f"({st['transactions']} expenses, rate of {today})")
+    cur = db.execute("INSERT INTO transactions (date,description,amount,currency,fx_rate,amount_chf,category_id,note) "
+                     "VALUES (?,?,?,'CHF',1,?,?,?)", (line_date, name, chf, chf, cid, note))
+    db.execute("UPDATE transactions SET rollup_id=? WHERE currency=? AND substr(date,1,7)=?",
+               (cur.lastrowid, body.currency, month))
+    return {**one(db, f"{TX_SELECT} WHERE t.id=?", (cur.lastrowid,)),
+            "pulled": {"currency": body.currency, "total": st["total"], "transactions": st["transactions"],
+                       "rate": rate, "fee_pct": body.fee_pct, "replaced_existing_line": bool(st["line_ids"])}}
 
 
 @router.patch("/transactions/{tx_id}", tags=["transactions"])
@@ -953,8 +1040,8 @@ def get_investment_history(months: int = Query(24, ge=1, le=240), end: Optional[
 
 def month_totals(db, month: str) -> dict:
     inc = db.execute("SELECT COALESCE(SUM(amount_chf),0) FROM income WHERE substr(date,1,7)=?", (month,)).fetchone()[0]
-    exp = db.execute("SELECT COALESCE(SUM(amount_chf),0) FROM transactions WHERE substr(date,1,7)=?",
-                     (month,)).fetchone()[0]
+    exp = db.execute("SELECT COALESCE(SUM(amount_chf),0) FROM transactions WHERE substr(date,1,7)=? "
+                     "AND rollup_id IS NULL", (month,)).fetchone()[0]
     return {"month": month, "income_chf": r2(inc), "expenses_chf": r2(exp), "net_chf": r2(inc - exp),
             "savings_rate_pct": round((inc - exp) / inc * 100, 1) if inc > 0 else None}
 
@@ -978,7 +1065,10 @@ def monthly_report(month: Optional[str] = Query(None, pattern=MONTH), db=DB):
         "FROM transactions WHERE substr(date,1,7)=? AND currency<>'CHF' GROUP BY currency", (month,)))
     for f in foreign:
         f["total"], f["total_chf"] = r2(f["total"]), r2(f["total_chf"])
-    n = db.execute("SELECT COUNT(*) FROM transactions WHERE substr(date,1,7)=?", (month,)).fetchone()[0]
+    n = db.execute("SELECT COUNT(*) FROM transactions WHERE substr(date,1,7)=? AND rollup_id IS NULL",
+                   (month,)).fetchone()[0]
+    rec_counted = db.execute("SELECT COALESCE(SUM(amount_chf),0) FROM transactions WHERE recurring_id IS NOT NULL "
+                             "AND rollup_id IS NULL AND substr(date,1,7)=?", (month,)).fetchone()[0]
     transferred = db.execute("SELECT COALESCE(SUM(amount_chf),0) FROM flows WHERE substr(date,1,7)=?",
                              (month,)).fetchone()[0]
     after_unpaid = r2(totals["net_chf"] - rec["unpaid_chf"])
@@ -987,7 +1077,7 @@ def monthly_report(month: Optional[str] = Query(None, pattern=MONTH), db=DB):
         "income": {"total_chf": totals["income_chf"], "by_person": people,
                    "missing_for": [p["person"] for p in people if p["entries"] == 0]},
         "expenses": {"total_chf": totals["expenses_chf"], "transactions": n,
-                     "recurring_chf": rec["paid_chf"], "variable_chf": r2(totals["expenses_chf"] - rec["paid_chf"]),
+                     "recurring_chf": r2(rec_counted), "variable_chf": r2(totals["expenses_chf"] - rec_counted),
                      "by_category": budgets, "foreign_currency": foreign},
         "recurring": rec,
         "budgets": {"over_budget": [b["category"] for b in budgets if b["over_budget"]],
@@ -1023,7 +1113,7 @@ def category_trend(months: int = Query(12, ge=1, le=120), end: Optional[str] = Q
     data = rows(db.execute(
         "SELECT substr(t.date,1,7) AS m, COALESCE(c.name,'Uncategorised') AS category, SUM(t.amount_chf) AS total "
         "FROM transactions t LEFT JOIN categories c ON c.id=t.category_id "
-        "WHERE substr(t.date,1,7) BETWEEN ? AND ? GROUP BY m, category", (ms[0], ms[-1])))
+        "WHERE substr(t.date,1,7) BETWEEN ? AND ? AND t.rollup_id IS NULL GROUP BY m, category", (ms[0], ms[-1])))
     cats: dict = {}
     for d in data:
         cats.setdefault(d["category"], [0.0] * len(ms))[ms.index(d["m"])] = r2(d["total"])
@@ -1039,7 +1129,8 @@ def yearly_report(year: Optional[int] = None, db=DB):
     series = [month_totals(db, m) for m in ms]
     cats = rows(db.execute(
         "SELECT COALESCE(c.name,'Uncategorised') AS category, SUM(t.amount_chf) AS total_chf FROM transactions t "
-        "LEFT JOIN categories c ON c.id=t.category_id WHERE substr(t.date,1,4)=? GROUP BY category "
+        "LEFT JOIN categories c ON c.id=t.category_id WHERE substr(t.date,1,4)=? AND t.rollup_id IS NULL "
+        "GROUP BY category "
         "ORDER BY total_chf DESC", (str(year),)))
     inc, exp = sum(s["income_chf"] for s in series), sum(s["expenses_chf"] for s in series)
     return {"year": year, "income_chf": r2(inc), "expenses_chf": r2(exp), "net_chf": r2(inc - exp),

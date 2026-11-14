@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import db
+from . import db, fx
 from .api import public, router
 
 DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "1113"))
@@ -23,10 +23,28 @@ API_PORT = int(os.environ.get("API_PORT", "1311"))
 STATIC = Path(__file__).resolve().parent / "static"
 
 
+FX_REFRESH_SECONDS = 6 * 3600
+
+
+async def _fx_job():
+    """Store the day's exchange rates: once at start, then every few hours."""
+    while True:
+        try:
+            result = await asyncio.to_thread(fx.refresh_daily_rates)
+            if result["rates"]:
+                print(f"Exchange rates for {result['date']}: {result['rates']}", flush=True)
+        except Exception as e:                      # never let a failed fetch stop the job
+            print(f"Exchange-rate refresh failed: {getattr(e, 'detail', e)}", flush=True)
+        await asyncio.sleep(FX_REFRESH_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(_app):
     db.init_db()
+    job = asyncio.create_task(_fx_job()) if fx.AUTO_FETCH else None
     yield
+    if job:
+        job.cancel()
 
 
 app = FastAPI(

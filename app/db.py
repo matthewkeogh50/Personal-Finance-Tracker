@@ -2,6 +2,7 @@
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 
@@ -75,7 +76,10 @@ CREATE TABLE IF NOT EXISTS transactions (
     statement_id INTEGER REFERENCES statements(id) ON DELETE SET NULL,
     account TEXT,
     note TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    -- set on a foreign-currency expense that has been pulled into a single CHF summary line
+    -- ("UK expenses"); such rows are left out of CHF totals because the summary line counts them
+    rollup_id INTEGER REFERENCES transactions(id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tx_date ON transactions(date);
 CREATE TABLE IF NOT EXISTS fx_rates (
@@ -278,6 +282,10 @@ def init_db() -> None:
     try:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
+        # columns added after the first release (an existing file keeps its old table definition)
+        if "rollup_id" not in {r["name"] for r in conn.execute("PRAGMA table_info(transactions)")}:
+            conn.execute("ALTER TABLE transactions ADD COLUMN rollup_id INTEGER "
+                         "REFERENCES transactions(id) ON DELETE SET NULL")
         _seed(conn)
         conn.commit()
     finally:
@@ -287,6 +295,12 @@ def init_db() -> None:
 def get_db():
     """FastAPI dependency: a connection for one request, committed (and persisted) on success."""
     yield from (_get_db_dynamo() if STORAGE == "dynamodb" else _get_db_sqlite())
+
+
+@contextmanager
+def session():
+    """The same connection handling as get_db, for code that runs outside a request (background jobs)."""
+    yield from get_db()
 
 
 def storage_info() -> dict:
