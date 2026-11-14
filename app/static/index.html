@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Household Finances</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">Household<br><span>Finances</span></div>
+    <nav id="nav">
+      <a href="#/overview">Overview</a>
+      <a href="#/income">Salary</a>
+      <a href="#/expenses">Expenses</a>
+      <a href="#/budgets">Budgets</a>
+      <a href="#/recurring">Recurring</a>
+      <a href="#/investments">Investments</a>
+      <a href="#/gbp">GBP</a>
+      <a href="#/settings">Settings</a>
+    </nav>
+    <button id="theme" class="ghost" type="button">Toggle theme</button>
+  </aside>
+  <main>
+    <header class="topbar">
+      <h1 id="title">Overview</h1>
+      <div class="monthnav" id="monthnav">
+        <button class="ghost" id="prev" type="button" aria-label="Previous month">&lsaquo;</button>
+        <input type="month" id="month" aria-label="Month">
+        <button class="ghost" id="next" type="button" aria-label="Next month">&rsaquo;</button>
+      </div>
+    </header>
+    <div id="view"></div>
+  </main>
+  <dialog id="dlg"><form method="dialog" id="dlgform"></form></dialog>
+  <div id="toast" role="status"></div>
+  <script src="vendor/chart.umd.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

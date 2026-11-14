@@ -1,0 +1,22 @@
+services:
+  finance:
+    build: .
+    container_name: finance-tracker
+    restart: unless-stopped
+    ports:
+      - "1113:1113"   # dashboard
+      - "1311:1311"   # API
+    environment:
+      # All data (including uploaded bank screenshots) is stored in DynamoDB; the container keeps no state.
+      # Values come from a .env file next to this file (copy .env.example to .env and fill it in).
+      STORAGE: dynamodb
+      DYNAMODB_TABLE: ${DYNAMODB_TABLE:-household-finance}
+      AWS_REGION: ${AWS_REGION:?Set AWS_REGION in .env}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?Set AWS_ACCESS_KEY_ID in .env}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?Set AWS_SECRET_ACCESS_KEY in .env}
+      # Create the table on first start if it does not exist (needs dynamodb:CreateTable).
+      DYNAMODB_CREATE_TABLE: ${DYNAMODB_CREATE_TABLE:-true}
+      # Set a value to require the X-API-Key header on every API call (recommended on a shared network).
+      API_KEY: ${API_KEY:-}
+      # Look up missing GBP->CHF rates from frankfurter.dev (ECB reference rates). "false" = never call out.
+      FX_AUTO_FETCH: ${FX_AUTO_FETCH:-true}
