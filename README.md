@@ -80,14 +80,16 @@ keeps a local SQLite file instead.
 
 ## Screens
 
-- **Overview** — income, spending, left over, net worth; income vs expenses and net worth over time; budgets; what to send to savings.
+- **Overview** — income, spending, left over, net worth; income vs expenses and net worth over time; spending by category; what to send to savings.
 - **Salary** — both salaries by month and by year.
 - **Expenses** — the month's transactions, category trend, uploaded bank screenshots. **Pull UK expenses** turns the month's GBP expenses into one CHF line at today's rate plus 10 % for transfer (Wise) fees.
-- **Budgets** — budget vs spent per category, with history.
 - **Recurring** — rent, car payment, etc.: paid / not paid for the month.
 - **Investments** — accounts, value over time, gain and return vs money paid in.
 - **GBP** — UK spending in pounds and CHF, exchange-rate history.
 - **Settings** — names, categories, links for the agent.
+
+There is no budgets screen. Budgets can still be set over the API (`PUT /api/budgets`); when a category
+has one, the spending bars show it.
 
 ## Try it with demo data
 

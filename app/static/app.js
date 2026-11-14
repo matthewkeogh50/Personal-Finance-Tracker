@@ -139,16 +139,17 @@ const kpi = (label, value, hint = '', cls = '') => `<section class="card kpi"><d
 const btn = (act, label, id = '', cls = 'small') => `<button type="button" class="${cls}" data-act="${act}" data-id="${id}">${label}</button>`;
 const table = (heads, rowsHtml, empty = 'Nothing recorded yet.') => (rowsHtml.length ? `<div class="scroll"><table><thead><tr>${heads.map((h) => `<th class="${h.startsWith('#') ? 'num' : ''}">${h.replace(/^#/, '')}</th>`).join('')}</tr></thead><tbody>${rowsHtml.join('')}</tbody></table></div>` : `<div class="empty">${empty}</div>`);
 
-function meters(items, withEdit) {
+function meters(items) {
   const list = items.filter((i) => i.budget_chf != null || i.spent_chf !== 0);
-  if (!list.length) return '<div class="empty">No spending or budgets for this month.</div>';
+  if (!list.length) return '<div class="empty">No spending recorded for this month.</div>';
+  const top = Math.max(...list.map((i) => i.spent_chf), 0);
   return list.map((i) => {
-    const has = i.budget_chf != null;
-    const w = has ? Math.min(100, (i.spent_chf / i.budget_chf) * 100) : 0;
-    const note = !has ? 'No budget set' : i.over_budget ? `⚠ Over by ${money(-i.remaining_chf)}` : `${money(i.remaining_chf)} left`;
+    const has = i.budget_chf != null;   // budgets can still be set over the API; shown when present
+    const w = has ? Math.min(100, (i.spent_chf / i.budget_chf) * 100) : top > 0 ? (i.spent_chf / top) * 100 : 0;
+    const note = !has ? '' : i.over_budget ? `⚠ Over by ${money(-i.remaining_chf)}` : `${money(i.remaining_chf)} left`;
     return `<div class="meter"><div class="meter-head"><span>${esc(i.category)}</span><span class="amt">${money0(i.spent_chf)}${has ? ` / ${nf0.format(i.budget_chf)}` : ''}</span></div>
       <div class="bar"><i class="${i.over_budget ? 'over' : ''}" style="width:${Math.max(0, w)}%;${has ? '' : 'background:var(--other)'}"></i></div>
-      <div class="note ${i.over_budget ? 'over' : ''}">${note}${withEdit && i.category_id ? ` · <a href="#" data-act="set-budget" data-id="${i.category_id}">${has ? 'change' : 'set budget'}</a>` : ''}</div></div>`;
+      ${note ? `<div class="note ${i.over_budget ? 'over' : ''}">${note}</div>` : ''}</div>`;
   }).join('');
 }
 
@@ -192,7 +193,7 @@ pages.overview = async () => {
     <td class="num">${r.paid ? `<span class="tag ok">✓ paid ${r.paid_date.slice(8)}.${r.paid_date.slice(5, 7)}.</span>` : '<span class="tag bad">○ not paid</span>'}</td></tr>`);
 
   $('#view').innerHTML = `
-    ${empty ? card('Getting started', `<p>No data yet. Your agent can load everything over the API on port 1311 — see <a href="/api/agent-guide" target="_blank">the agent guide</a>. You can also enter things by hand: start in <a href="#/settings">Settings</a> (names), then <a href="#/income">Salary</a>, <a href="#/recurring">Recurring</a>, <a href="#/budgets">Budgets</a> and <a href="#/investments">Investments</a>.</p>`) : ''}
+    ${empty ? card('Getting started', `<p>No data yet. Your agent can load everything over the API on port 1311 — see <a href="/api/agent-guide" target="_blank">the agent guide</a>. You can also enter things by hand: start in <a href="#/settings">Settings</a> (names), then <a href="#/income">Salary</a>, <a href="#/recurring">Recurring</a> and <a href="#/investments">Investments</a>.</p>`) : ''}
     <div class="grid kpis">
       ${kpi(`Income · ${monthLabel(m)}`, kpiVal(rep.income.total_chf), rep.income.missing_for.length && rep.income.total_chf ? `Nothing yet for ${esc(rep.income.missing_for.join(', '))}` : vs(rep.income.total_chf, prev?.income_chf))}
       ${kpi(`Spent · ${monthLabel(m)}`, kpiVal(rep.expenses.total_chf), vs(rep.expenses.total_chf, prev?.expenses_chf, true))}
@@ -204,7 +205,7 @@ pages.overview = async () => {
       ${card('Net worth', nw.accounts.length ? '<div class="chart"><canvas id="c2"></canvas></div>' : '<div class="empty">Add accounts under Investments to see this.</div>', '', 'Month-end value by account, CHF')}
     </div>
     <div class="grid two">
-      ${card('Spending vs budget', meters(rep.expenses.by_category), '<a href="#/budgets">Budgets →</a>', monthLabel(m, true))}
+      ${card('Spending by category', meters(rep.expenses.by_category), '<a href="#/expenses">Expenses →</a>', monthLabel(m, true))}
       <div>
         ${card('To savings this month', `<table>
             <tr><td>Income</td><td class="num">${nf.format(rep.income.total_chf)}</td></tr>
@@ -316,40 +317,6 @@ pages.expenses = async () => {
       ], (v) => api('/transactions/rollup', { method: 'POST', json: { ...v, month: m, currency: 'GBP' } }),
       p.existing ? `Replace the existing line (${money(p.existing.amount_chf)})` : 'Add “UK expenses” line');
     },
-  };
-};
-
-pages.budgets = async () => {
-  const m = state.month;
-  const [st, hist] = await Promise.all([api(`/budgets/status?month=${m}`), api(`/budgets/history?months=12&end=${m}`)]);
-  const budgeted = st.items.filter((i) => i.budget_chf != null);
-  const sel = pages.budgets.cat && budgeted.some((b) => b.category_id == pages.budgets.cat) ? pages.budgets.cat : budgeted[0]?.category_id;
-  const left = st.total_budget_chf - st.total_spent_in_budgeted_chf;
-  $('#view').innerHTML = `
-    <div class="grid kpis">
-      ${kpi('Total budget', kpiVal(st.total_budget_chf), `${budgeted.length} categories with a budget`)}
-      ${kpi('Spent in budgeted categories', kpiVal(st.total_spent_in_budgeted_chf), st.total_budget_chf ? `${((st.total_spent_in_budgeted_chf / st.total_budget_chf) * 100).toFixed(0)}% used` : '&nbsp;')}
-      ${kpi(left >= 0 ? 'Left this month' : 'Over budget', kpiVal(Math.abs(left)), st.over_budget.length ? `⚠ Over: ${esc(st.over_budget.join(', '))}` : 'All categories within budget', signCls(left))}
-    </div>
-    <div class="grid two">
-      ${card('Budget vs spent', meters(st.items, true), btn('set-budget', '+ Set a budget', '', 'primary'), monthLabel(m, true))}
-      ${card('History', budgeted.length ? '<div class="chart"><canvas id="c1"></canvas></div>' : '<div class="empty">Set a budget to see its history.</div>',
-        `<select id="bcat">${budgeted.map((b) => `<option value="${b.category_id}" ${b.category_id == sel ? 'selected' : ''}>${esc(b.category)}</option>`).join('')}</select>`, 'Spent against budget, last 12 months, CHF')}
-    </div>`;
-  if (budgeted.length) {
-    const pick = (h) => h.items.find((i) => i.category_id == sel);
-    chart('c1', 'bar', { labels: hist.map((h) => monthLabel(h.month)), datasets: [
-      barSet('Spent', hist.map((h) => pick(h)?.spent_chf ?? 0), series(0)),
-      { ...lineSet('Budget', hist.map((h) => pick(h)?.budget_chf ?? null), cssVar('--ink-2')), type: 'line', stepped: 'middle', borderDash: [5, 4], tension: 0 },
-    ] });
-    $('#bcat').onchange = (e) => { pages.budgets.cat = e.target.value; render(); };
-  }
-  actions = {
-    'set-budget': (id) => openForm('Set monthly budget', [
-      { name: 'category_id', label: 'Category', type: 'select', options: catOptions().slice(1), value: id, numeric: true, required: true },
-      { name: 'amount', label: 'Budget per month in CHF (0 removes it)', type: 'number', value: st.items.find((i) => i.category_id == id)?.budget_chf, required: true },
-      { name: 'valid_from', label: 'Applies from', type: 'month', value: m, required: true },
-    ], (v) => api('/budgets', { method: 'PUT', json: v })),
   };
 };
 
@@ -515,7 +482,7 @@ pages.settings = async () => {
 };
 
 // ---------------------------------------------------------------- router
-const TITLES = { overview: 'Overview', income: 'Salary', expenses: 'Expenses', budgets: 'Budgets', recurring: 'Recurring charges', investments: 'Investments', gbp: 'GBP expenses', settings: 'Settings' };
+const TITLES = { overview: 'Overview', income: 'Salary', expenses: 'Expenses', recurring: 'Recurring charges', investments: 'Investments', gbp: 'GBP expenses', settings: 'Settings' };
 
 async function render() {
   const route = (location.hash.replace('#/', '') || 'overview').split('?')[0];
