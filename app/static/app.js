@@ -54,6 +54,8 @@ const CURRENCIES = [['CHF', 'CHF'], ['GBP', 'GBP'], ['EUR', 'EUR'], ['USD', 'USD
 // ---------------------------------------------------------------- modal form
 function openForm(title, fields, onSubmit, submitLabel = 'Save') {
   const dlg = $('#dlg'), form = $('#dlgform');
+  if (dlg.open) dlg.close();
+  dlg.classList.remove('wide');
   form.innerHTML = `<h2>${esc(title)}</h2>` + fields.map((f) => {
     const req = f.required ? 'required' : '';
     const val = f.value ?? '';
@@ -157,7 +159,7 @@ function txFields(t = {}) {
   return [
     { name: 'date', label: 'Date', type: 'date', value: t.date || (state.month === today().slice(0, 7) ? today() : state.month + '-01'), required: true },
     { name: 'description', label: 'Description', value: t.description, required: true },
-    { name: 'amount', label: 'Amount (positive = spent, negative = refund)', type: 'number', value: t.amount, required: true },
+    { name: 'amount', label: 'Amount (positive = spent, negative = money in / refund)', type: 'number', value: t.amount, required: true },
     { name: 'currency', label: 'Currency', type: 'select', options: CURRENCIES, value: t.currency || 'CHF' },
     { name: 'category_id', label: 'Category', type: 'select', options: catOptions(), value: t.category_id, numeric: true },
     { name: 'person_id', label: 'Who (optional)', type: 'select', options: personOptions('— joint —'), value: t.person_id, numeric: true },
@@ -165,17 +167,30 @@ function txFields(t = {}) {
     { name: 'note', label: 'Note (optional)', value: t.note },
   ];
 }
+// money received is stored as a negative expense; show it as a green "+"
+const signed = (v, prefix = '') => (v < 0 ? `<span class="pos">+ ${prefix}${nf.format(-v)}</span>` : `${prefix}${nf.format(v)}`);
+const moneyInFields = (defaults = {}) => txFields(defaults).map((f) => (f.name === 'amount' ? { ...f, label: 'Amount received (e.g. rent from the UK house)' } : f));
+const addMoneyIn = (defaults) => openForm('Add money in', moneyInFields(defaults), (v) => api('/transactions', { method: 'POST', json: { ...v, amount: -Math.abs(v.amount) } }));
+function ukBox(u) {
+  const surplus = u.to_send < 0;
+  const parts = [`Charges ${money(u.charges, 'GBP')}`];
+  if (u.unpaid_recurring) parts.push(`+ ${nf.format(u.unpaid_recurring)} not yet paid`);
+  parts.push(`− ${nf.format(u.received)} received`);
+  return kpi(surplus ? 'Surplus in the UK' : 'Needs to be sent to the UK', `<small>GBP</small>${nf.format(Math.abs(u.to_send))}`,
+    `<b style="color:var(--ink);font-size:14px">= ${money(Math.abs(u.to_send_chf))}</b><br>${parts.join(' ')}`, surplus ? 'pos' : '');
+}
 function txRows(list, showCur) {
-  return list.map((t) => `<tr><td>${t.date}</td><td>${esc(t.description)}${t.recurring ? ' <span class="tag">recurring</span>' : ''}${t.is_rollup ? ' <span class="tag ok">pulled from GBP</span>' : ''}${t.rollup_id ? ' <span class="tag">in UK expenses</span>' : ''}${t.note ? `<div class="sub" style="color:var(--muted);font-size:12px">${esc(t.note)}</div>` : ''}</td>
+  return list.map((t) => `<tr><td>${t.date}</td><td>${esc(t.description)}${t.recurring ? ' <span class="tag">recurring</span>' : ''}${t.amount < 0 ? ' <span class="tag ok">money in</span>' : ''}${t.is_rollup ? ' <span class="tag ok">pulled from GBP</span>' : ''}${t.rollup_id ? ' <span class="tag">in UK expenses</span>' : ''}${t.note ? `<div class="sub" style="color:var(--muted);font-size:12px">${esc(t.note)}</div>` : ''}</td>
     <td>${t.category ? `<span class="tag">${esc(t.category)}</span>` : '<span class="tag bad">uncategorised</span>'}</td>
-    ${showCur ? `<td class="num">${money(t.amount, t.currency)}</td>` : ''}
-    <td class="num">${t.currency !== 'CHF' && !showCur ? `<span class="tag">${money(t.amount, t.currency)}</span> ` : ''}${nf.format(t.amount_chf)}</td>
+    ${showCur ? `<td class="num">${signed(t.amount, t.currency + ' ')}</td>` : ''}
+    <td class="num">${t.currency !== 'CHF' && !showCur ? `<span class="tag">${money(Math.abs(t.amount), t.currency)}</span> ` : ''}${signed(t.amount_chf)}</td>
     <td class="actions">${btn('edit-tx', 'Edit', t.id, 'small ghost')}${btn('del-tx', 'Delete', t.id, 'small ghost danger')}</td></tr>`);
 }
 const txActions = (list) => ({
   'add-tx': () => openForm('Add expense', txFields(), (v) => api('/transactions', { method: 'POST', json: v })),
   'edit-tx': (id) => openForm('Edit expense', txFields(list.find((t) => t.id == id)), (v) => api(`/transactions/${id}`, { method: 'PATCH', json: v })),
   'del-tx': (id) => confirmDelete(`/transactions/${id}`, 'this expense'),
+  'add-in': () => addMoneyIn(),
 });
 
 // ---------------------------------------------------------------- pages
@@ -267,22 +282,22 @@ pages.income = async () => {
 pages.expenses = async () => {
   const m = state.month;
   const [rep, txs, trend, stmts] = await Promise.all([api(`/reports/monthly?month=${m}`), api(`/transactions?month=${m}`), api(`/reports/categories?months=12&end=${m}`), api(`/statements?month=${m}`)]);
-  const f = pages.expenses.filter || (pages.expenses.filter = { cat: '', q: '' });
+  const f = pages.expenses.filter || (pages.expenses.filter = { cat: '', q: '', cur: '' });
   const key = localStorage.getItem('apiKey');
   const stRows = stmts.map((s) => `<tr><td><a href="/api/statements/${s.id}/file${key ? `?api_key=${encodeURIComponent(key)}` : ''}" target="_blank">${esc(s.filename)}</a></td><td>${esc(s.note)}</td><td class="num">${s.transactions} transactions</td><td>${s.uploaded_at.slice(0, 10)}</td><td class="actions">${btn('del-st', 'Delete', s.id, 'small ghost danger')}</td></tr>`);
   const pulled = txs.filter((t) => t.rollup_id).length;
   const draw = () => {
     const q = f.q.toLowerCase();
-    const list = txs.filter((t) => !t.rollup_id && (f.cat === '' || (f.cat === 'none' ? t.category_id == null : t.category_id == f.cat)) && (!q || `${t.description} ${t.note || ''}`.toLowerCase().includes(q)));
-    $('#txtable').innerHTML = table(['Date', 'Description', 'Category', '#CHF', ''], txRows(list), 'No expenses match.') +
-      (list.length ? `<div class="sub" style="color:var(--muted);margin-top:8px">${list.length} transactions · ${money(list.reduce((s, t) => s + t.amount_chf, 0))}${pulled ? ` · ${pulled} GBP expenses are inside the “UK expenses” line (<a href="#/gbp">see them</a>)` : ''}</div>` : '');
+    const list = txs.filter((t) => (f.cur ? (f.cur === 'other' ? !['CHF', 'GBP'].includes(t.currency) : t.currency === f.cur) : !t.rollup_id) && (f.cat === '' || (f.cat === 'none' ? t.category_id == null : t.category_id == f.cat)) && (!q || `${t.description} ${t.note || ''}`.toLowerCase().includes(q)));
+    $('#txtable').innerHTML = (f.cur === 'GBP' ? table(['Date', 'Description', 'Category', '#GBP', '#CHF', ''], txRows(list, true), 'No GBP expenses this month.') : table(['Date', 'Description', 'Category', '#CHF', ''], txRows(list), 'No expenses match.')) +
+      (list.length ? `<div class="sub" style="color:var(--muted);margin-top:8px">${list.length} transactions · ${f.cur === 'GBP' ? `${money(list.reduce((s, t) => s + t.amount, 0), 'GBP')} = ` : ''}${money(list.reduce((s, t) => s + t.amount_chf, 0))}${pulled && !f.cur ? ` · ${pulled} GBP expenses are inside the “UK expenses” line (<a href="#/gbp">see them</a>)` : ''}</div>` : '');
   };
   $('#view').innerHTML = `
     <div class="grid kpis">
       ${kpi('Total spent', kpiVal(rep.expenses.total_chf), `${rep.expenses.transactions} transactions`)}
       ${kpi('Recurring charges', kpiVal(rep.expenses.recurring_chf), rep.recurring.unpaid.length ? `${rep.recurring.unpaid.length} still unpaid` : 'All paid')}
       ${kpi('Everything else', kpiVal(rep.expenses.variable_chf), 'Day-to-day spending')}
-      ${kpi('In GBP', kpiVal(rep.expenses.foreign_currency.find((x) => x.currency === 'GBP')?.total ?? 0, 'GBP'), `= ${money0(rep.expenses.foreign_currency.find((x) => x.currency === 'GBP')?.total_chf ?? 0)}`)}
+      ${ukBox(rep.uk_transfer)}
     </div>
     <div class="grid two">
       ${card('Spending by category', '<div class="chart"><canvas id="c1"></canvas></div>', '', 'Last 12 months, CHF')}
@@ -290,11 +305,16 @@ pages.expenses = async () => {
     </div>
     ${card(`Expenses in ${monthLabel(m, true)}`, '<div id="txtable"></div>', `
       <input type="search" id="fq" placeholder="Search…" value="${esc(f.q)}">
+      <select id="fcur" aria-label="Currency"><option value="">All currencies</option><option value="CHF">CHF only</option><option value="GBP">GBP only</option>${txs.some((t) => !['CHF', 'GBP'].includes(t.currency)) ? '<option value="other">Other currencies</option>' : ''}</select>
       <select id="fcat"><option value="">All categories</option><option value="none">Uncategorised</option>${state.categories.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select>
+      ${btn('refresh-gbp', 'Refresh GBP rate', '', '')}
       ${btn('pull-uk', 'Pull UK expenses', '', '')}
+      ${btn('add-in', '+ Money in', '', '')}
       ${btn('add-tx', '+ Add expense', '', 'primary')}`)}
     <div style="height:14px"></div>
     ${card('Bank screenshots / statements', table(['File', 'Note', '#Linked', 'Uploaded', ''], stRows, 'No screenshots uploaded for this month.'), btn('add-st', 'Upload', '', ''), 'Source documents the agent uploaded for this month')}`;
+  $('#fcur').value = f.cur || '';
+  $('#fcur').onchange = (e) => { f.cur = e.target.value; draw(); };
   $('#fcat').value = f.cat;
   $('#fcat').onchange = (e) => { f.cat = e.target.value; draw(); };
   $('#fq').oninput = (e) => { f.q = e.target.value; draw(); };
@@ -308,6 +328,12 @@ pages.expenses = async () => {
       return api('/statements', { method: 'POST', body: fd });
     }, 'Upload'),
     'del-st': (id) => confirmDelete(`/statements/${id}`, 'this file'),
+    'refresh-gbp': async () => {
+      if (!confirm(`Get today's GBP rate and re-convert all GBP expenses in ${monthLabel(m, true)} with it? Other months are not changed.`)) return;
+      const r = await api('/fx/reapply', { method: 'POST', json: { currency: 'GBP', month: m } });
+      toast(r.updated_transactions ? `GBP rate ${r.rate.toFixed(4)} (${r.source}) applied to ${r.updated_transactions} expenses: ${money(r.before_chf)} → ${money(r.after_chf)}` : `No GBP expenses in ${monthLabel(m, true)}. Today's rate: ${r.rate.toFixed(4)}`);
+      render();
+    },
     'pull-uk': async () => {
       const p = await api(`/transactions/rollup?month=${m}&currency=GBP`);
       if (!p.transactions) { toast(`No GBP expenses in ${monthLabel(m, true)}.`); return; }
@@ -335,10 +361,10 @@ pages.recurring = async () => {
   const stRows = st.items.map((r) => `<tr><td>${esc(r.name)}</td><td>${r.category ? `<span class="tag">${esc(r.category)}</span>` : ''}</td><td>${r.day_of_month ? r.day_of_month + '.' : '–'}</td>
     <td class="num">${money(r.expected_amount, r.currency)}</td><td class="num">${r.paid ? money(r.paid_amount, r.currency) : '–'}</td>
     <td>${r.paid ? `<span class="tag ok">✓ paid ${r.paid_date}</span>${r.difference ? ` <span class="tag bad">${r.difference > 0 ? '+' : ''}${nf.format(r.difference)}</span>` : ''}` : '<span class="tag bad">○ not paid</span>'}</td>
-    <td class="actions">${r.paid ? '' : btn('pay', 'Mark paid', r.recurring_id)}</td></tr>`);
+    <td class="actions">${r.has_invoice ? btn('qr', 'QR invoice', r.recurring_id) : ''}${r.paid ? '' : btn('pay', 'Mark paid', r.recurring_id)}</td></tr>`);
   const defRows = defs.map((r) => `<tr><td>${esc(r.name)}</td><td>${esc(r.category)}</td><td class="num">${money(r.amount, r.currency)}</td><td>${r.start_month || '–'} → ${r.end_month || 'ongoing'}</td>
     <td>${r.active ? '<span class="tag ok">active</span>' : '<span class="tag">inactive</span>'}</td>
-    <td class="actions">${btn('edit', 'Edit', r.id, 'small ghost')}${btn('toggle', r.active ? 'Deactivate' : 'Activate', r.id, 'small ghost')}${btn('del', 'Delete', r.id, 'small ghost danger')}</td></tr>`);
+    <td class="actions">${r.invoice_file ? btn('qr', 'QR invoice', r.id) : btn('attach', 'Attach QR invoice', r.id, 'small ghost')}${btn('edit', 'Edit', r.id, 'small ghost')}${btn('toggle', r.active ? 'Deactivate' : 'Activate', r.id, 'small ghost')}${btn('del', 'Delete', r.id, 'small ghost danger')}</td></tr>`);
   $('#view').innerHTML = `
     <div class="grid kpis">
       ${kpi('Expected this month', kpiVal(st.expected_chf), `${st.items.length} charges`)}
@@ -353,6 +379,25 @@ pages.recurring = async () => {
     edit: (id) => openForm('Edit recurring charge', fields(defs.find((r) => r.id == id)), (v) => api(`/recurring/${id}`, { method: 'PATCH', json: v })),
     toggle: async (id) => { await api(`/recurring/${id}`, { method: 'PATCH', json: { active: !defs.find((r) => r.id == id).active } }); render(); },
     del: (id) => confirmDelete(`/recurring/${id}`, 'this recurring charge (past payments are kept)'),
+    attach: (id) => openForm(`QR invoice for "${defs.find((r) => r.id == id).name}"`, [{ name: 'file', label: 'Photo, screenshot or PDF of the QR invoice', type: 'file', required: true }], (v) => {
+      const fd = new FormData(); fd.append('file', v.file);
+      return api(`/recurring/${id}/invoice`, { method: 'PUT', body: fd });
+    }, 'Attach'),
+    'remove-qr': async (id) => {
+      if (!confirm('Remove the QR invoice from this charge?')) return;
+      await api(`/recurring/${id}/invoice`, { method: 'DELETE' }); $('#dlg').close(); toast('Removed'); render();
+    },
+    qr: (id) => {
+      const r = defs.find((x) => x.id == id), key = localStorage.getItem('apiKey');
+      const url = `/api/recurring/${id}/invoice${key ? `?api_key=${encodeURIComponent(key)}` : ''}`;
+      const isImage = (r.invoice_content_type || '').startsWith('image/');
+      const dlg = $('#dlg'), form = $('#dlgform');
+      form.innerHTML = `<h2>QR invoice · ${esc(r.name)} · ${money(r.amount, r.currency)}</h2>
+        ${isImage ? `<img class="qr" src="${url}" alt="QR invoice for ${esc(r.name)}">` : `<iframe class="qr" src="${url}" title="QR invoice for ${esc(r.name)}"></iframe>`}
+        <div class="row">${btn('remove-qr', 'Remove', id, 'ghost danger')}${btn('attach', 'Replace', id, '')}<a class="btn" href="${url}" target="_blank">Open in new tab</a><button class="primary" type="submit">Close</button></div>`;
+      form.onsubmit = (e) => { e.preventDefault(); dlg.close(); };
+      dlg.classList.add('wide'); dlg.showModal();
+    },
     pay: (id) => {
       const r = st.items.find((x) => x.recurring_id == id);
       openForm(`Mark "${r.name}" as paid`, [
@@ -459,12 +504,13 @@ pages.investments = async () => {
 
 pages.gbp = async () => {
   const m = state.month;
-  const [rep, txs, rates, cur] = await Promise.all([api(`/reports/foreign?currency=GBP&months=12&end=${m}`), api(`/transactions?currency=GBP&date_from=${shiftMonth(m, -11)}-01&date_to=${m}-31`), api('/fx?currency=GBP'), api('/fx/rate?currency=GBP').catch(() => null)]);
+  const [rep, txs, rates, cur, monthly] = await Promise.all([api(`/reports/foreign?currency=GBP&months=12&end=${m}`), api(`/transactions?currency=GBP&date_from=${shiftMonth(m, -11)}-01&date_to=${m}-31`), api('/fx?currency=GBP'), api('/fx/rate?currency=GBP').catch(() => null), api(`/reports/monthly?month=${m}`)]);
   const now = rep.series.at(-1);
   const recRows = rep.recurring.map((r) => `<tr><td>${esc(r.name)}</td><td>${esc(r.category)}</td><td class="num">${money(r.amount, 'GBP')}</td></tr>`);
   $('#view').innerHTML = `
     <div class="grid kpis">
       ${kpi(`Spent in GBP · ${monthLabel(m)}`, kpiVal(now.total, 'GBP'), `= ${money(now.total_chf)} · ${now.transactions} transactions`)}
+      ${ukBox(monthly.uk_transfer)}
       ${kpi('Last 12 months', kpiVal(rep.total, 'GBP'), `= ${money(rep.total_chf)}`)}
       ${kpi('GBP → CHF today', cur ? cur.rate.toFixed(4) : '–', cur ? '1 GBP in CHF' : 'No rate stored yet')}
     </div>
@@ -473,13 +519,14 @@ pages.gbp = async () => {
       ${card('Exchange rate', rates.length > 1 ? '<div class="chart short"><canvas id="c2"></canvas></div>' : '<div class="empty">Rates appear here as GBP expenses are recorded.</div>', btn('rate', 'Set a rate'), 'CHF per 1 GBP, as stored')}
     </div>
     <div class="grid two">
-      ${card('GBP expenses', table(['Date', 'Description', 'Category', '#GBP', '#CHF', ''], txRows(txs, true), 'No GBP expenses in the last 12 months.'), btn('add-gbp', '+ Add GBP expense', '', 'primary'), 'Last 12 months')}
+      ${card('GBP expenses', table(['Date', 'Description', 'Category', '#GBP', '#CHF', ''], txRows(txs, true), 'No GBP expenses in the last 12 months.'), btn('add-in', '+ Money in', '', '') + btn('add-gbp', '+ Add GBP expense', '', 'primary'), 'Last 12 months')}
       ${card('Recurring charges in GBP', table(['Charge', 'Category', '#Per month'], recRows, 'None. Add them under Recurring with currency GBP.'))}
     </div>`;
   chart('c1', 'bar', { labels: rep.months.map((x) => monthLabel(x)), datasets: [barSet('GBP', rep.series.map((s) => s.total), series(0))] }, { fmt: (v) => money(v, 'GBP') });
   if (rates.length > 1) chart('c2', 'line', { labels: rates.map((r) => r.date), datasets: [lineSet('CHF per GBP', rates.map((r) => r.rate), series(0))] }, { zero: false, fmt: (v) => v.toFixed(4), tick: (v) => v.toFixed(2) });
   actions = {
     ...txActions(txs),
+    'add-in': () => addMoneyIn({ currency: 'GBP' }),
     'add-gbp': () => openForm('Add GBP expense', txFields({ currency: 'GBP' }), (v) => api('/transactions', { method: 'POST', json: v })),
     rate: () => openForm('Set GBP → CHF rate', [{ name: 'date', label: 'Date', type: 'date', value: today(), required: true }, { name: 'rate', label: 'CHF per 1 GBP', type: 'number', step: '0.0001', value: cur?.rate, required: true }], (v) => api('/fx', { method: 'PUT', json: { ...v, currency: 'GBP' } })),
   };

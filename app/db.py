@@ -60,7 +60,11 @@ CREATE TABLE IF NOT EXISTS recurring (
     start_month TEXT,                      -- YYYY-MM, null = always
     end_month TEXT,                        -- YYYY-MM, null = open ended
     active INTEGER NOT NULL DEFAULT 1,
-    note TEXT
+    note TEXT,
+    -- an attached payment slip (Swiss QR invoice): stored file name, original name and type
+    invoice_file TEXT,
+    invoice_filename TEXT,
+    invoice_content_type TEXT
 );
 CREATE TABLE IF NOT EXISTS transactions (
     id INTEGER PRIMARY KEY,
@@ -286,6 +290,10 @@ def init_db() -> None:
         if "rollup_id" not in {r["name"] for r in conn.execute("PRAGMA table_info(transactions)")}:
             conn.execute("ALTER TABLE transactions ADD COLUMN rollup_id INTEGER "
                          "REFERENCES transactions(id) ON DELETE SET NULL")
+        have = {r["name"] for r in conn.execute("PRAGMA table_info(recurring)")}
+        for col in ("invoice_file", "invoice_filename", "invoice_content_type"):
+            if col not in have:
+                conn.execute(f"ALTER TABLE recurring ADD COLUMN {col} TEXT")
         _seed(conn)
         conn.commit()
     finally:

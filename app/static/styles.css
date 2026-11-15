@@ -113,3 +113,7 @@ code { background: var(--wash); padding: 1px 5px; border-radius: 5px; font-size:
   main { padding: 16px; }
   .two { grid-template-columns: 1fr; }
 }
+
+dialog.wide { width: min(760px, 96vw); }
+.qr { display: block; width: 100%; background: #fff; border-radius: 8px; border: 1px solid var(--border); }
+iframe.qr { height: 70vh; }

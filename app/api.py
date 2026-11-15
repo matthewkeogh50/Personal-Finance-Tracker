@@ -13,7 +13,10 @@ from urllib.parse import quote
 from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel, Field
 
+import re
+
 from . import db as dbm
+from . import fx as fxm
 from .fx import BASE, resolve_rate, to_chf
 
 API_KEY = os.environ.get("API_KEY", "")
@@ -463,7 +466,8 @@ def delete_statement(statement_id: int, db=DB):
 class TransactionIn(BaseModel):
     date: str = Field(pattern=DATE, description="Booking date YYYY-MM-DD")
     description: str = Field(min_length=1)
-    amount: float = Field(description="Positive = money spent, negative = refund. In `currency`.")
+    amount: float = Field(description="Positive = money spent, negative = money received (rent from the "
+                                      "UK house, refunds). In `currency`.")
     currency: str = Field("CHF", pattern=CUR, description="CHF or GBP (any ISO code works)")
     fx_rate: Optional[float] = Field(None, description="CHF per 1 unit of currency; omit to use stored/auto rate")
     category_id: Optional[int] = None
@@ -598,6 +602,16 @@ def rollup_name(currency: str) -> str:
     return "UK expenses" if currency == "GBP" else f"{currency} expenses"
 
 
+def rollup_chf(total: float, rate: float, fee_pct: float) -> float:
+    """CHF value of the summary line. Transfer fees only apply when money has to be sent abroad,
+    i.e. when the net total is positive (money received, such as UK rent, can make it negative)."""
+    return round(total * rate * (1 + (fee_pct if total > 0 else 0) / 100), 2)
+
+
+def rollup_note(currency: str, total: float, rate: float, fee_pct: float, n: int, day: str) -> str:
+    return f"{currency} {total:.2f} x {rate:.4f} + {fee_pct:g}% transfer fees ({n} expenses, rate of {day})"
+
+
 def rollup_state(db, month: str, currency: str) -> dict:
     r = db.execute("SELECT COALESCE(SUM(amount),0) AS total, COUNT(*) AS n, "
                    "COALESCE(SUM(rollup_id IS NULL),0) AS not_pulled FROM transactions "
@@ -621,7 +635,7 @@ def preview_rollup(month: Optional[str] = Query(None, pattern=MONTH), currency: 
     existing = one(db, f"{TX_SELECT} WHERE t.id=?", (st["line_ids"][0],)) if st["line_ids"] else None
     return {"month": month, "currency": currency, "total": st["total"], "transactions": st["transactions"],
             "not_yet_pulled": st["not_yet_pulled"], "rate": rate, "fee_pct": DEFAULT_TRANSFER_FEE_PCT,
-            "amount_chf": r2(st["total"] * rate * (1 + DEFAULT_TRANSFER_FEE_PCT / 100)) if rate else None,
+            "amount_chf": rollup_chf(st["total"], rate, DEFAULT_TRANSFER_FEE_PCT) if rate else None,
             "existing": existing}
 
 
@@ -656,9 +670,8 @@ def create_rollup(body: RollupIn = RollupIn(), db=DB):
     if st["line_ids"]:
         marks = ",".join("?" * len(st["line_ids"]))
         db.execute(f"DELETE FROM transactions WHERE id IN ({marks})", st["line_ids"])
-    chf = round(st["total"] * rate * (1 + body.fee_pct / 100), 2)
-    note = (f"{body.currency} {st['total']:.2f} x {rate:.4f} + {body.fee_pct:g}% transfer fees "
-            f"({st['transactions']} expenses, rate of {today})")
+    chf = rollup_chf(st["total"], rate, body.fee_pct)
+    note = rollup_note(body.currency, st["total"], rate, body.fee_pct, st["transactions"], today)
     cur = db.execute("INSERT INTO transactions (date,description,amount,currency,fx_rate,amount_chf,category_id,note) "
                      "VALUES (?,?,?,'CHF',1,?,?,?)", (line_date, name, chf, chf, cid, note))
     db.execute("UPDATE transactions SET rollup_id=? WHERE currency=? AND substr(date,1,7)=?",
@@ -750,6 +763,7 @@ def recurring_status(db, month: str) -> dict:
         p = paid.get(r["id"])
         items.append({"recurring_id": r["id"], "name": r["name"], "category": r["category"],
                       "currency": r["currency"], "day_of_month": r["day_of_month"],
+                      "has_invoice": bool(r["invoice_file"]), "invoice_content_type": r["invoice_content_type"],
                       "expected_amount": r["amount"], "expected_chf": expected_chf,
                       "paid": bool(p), "paid_amount": r2(p["amount"]) if p else 0.0,
                       "paid_chf": r2(p["chf"]) if p else 0.0, "paid_date": p["date"] if p else None,
@@ -797,8 +811,64 @@ def update_recurring(recurring_id: int, body: RecurringPatch, db=DB):
 
 @router.delete("/recurring/{recurring_id}", tags=["recurring"])
 def delete_recurring(recurring_id: int, db=DB):
-    """Delete the definition. Past payments stay as ordinary transactions."""
+    """Delete the definition (and its attached QR invoice). Past payments stay as ordinary transactions."""
+    rec = one(db, "SELECT * FROM recurring WHERE id=?", (recurring_id,), "Recurring charge")
+    if rec["invoice_file"]:
+        dbm.delete_file(rec["invoice_file"])
     return delete_row(db, "recurring", recurring_id, "Recurring charge")
+
+
+@router.put("/recurring/{recurring_id}/invoice", tags=["recurring"])
+def attach_invoice(recurring_id: int, file: UploadFile = File(...), db=DB):
+    """Attach a payment slip (Swiss QR invoice) to a recurring charge: an image or PDF, multipart/form-data
+    field `file`. One per charge; uploading again replaces it. The app stores the file as it is so it
+    can be opened and scanned with a banking app later; it does not read the QR code."""
+    rec = one(db, "SELECT * FROM recurring WHERE id=?", (recurring_id,), "Recurring charge")
+    ctype = file.content_type or ""
+    if not (ctype.startswith("image/") or ctype == "application/pdf"):
+        raise HTTPException(415, "Only images and PDFs are accepted")
+    data = file.file.read()
+    if not data:
+        raise HTTPException(422, "The file is empty")
+    if len(data) > 25 * 1024 * 1024:
+        raise HTTPException(413, "File larger than 25 MB")
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf", ".heic"):
+        ext = ".pdf" if ctype == "application/pdf" else ".png"
+    stored = f"invoice-{uuid.uuid4().hex}{ext}"
+    try:
+        dbm.save_file(stored, data)
+        if rec["invoice_file"]:
+            dbm.delete_file(rec["invoice_file"])
+    except Exception as e:
+        raise HTTPException(503, f"Could not store the file: {e}")
+    update_row(db, "recurring", recurring_id, {"invoice_file": stored, "invoice_filename": file.filename or stored,
+                                               "invoice_content_type": ctype})
+    return one(db, f"{REC_SELECT} WHERE r.id=?", (recurring_id,))
+
+
+@router.get("/recurring/{recurring_id}/invoice", tags=["recurring"])
+def get_invoice(recurring_id: int, db=DB):
+    """The attached QR invoice file. 404 if the charge has none."""
+    rec = one(db, "SELECT * FROM recurring WHERE id=?", (recurring_id,), "Recurring charge")
+    data = dbm.read_file(rec["invoice_file"]) if rec["invoice_file"] else None
+    if data is None:
+        raise HTTPException(404, "This recurring charge has no invoice attached")
+    return Response(data, media_type=rec["invoice_content_type"] or "application/octet-stream",
+                    headers={"Content-Disposition": f"inline; filename*=UTF-8''{quote(rec['invoice_filename'] or 'invoice')}",
+                             "Cache-Control": "no-store"})
+
+
+@router.delete("/recurring/{recurring_id}/invoice", tags=["recurring"])
+def remove_invoice(recurring_id: int, db=DB):
+    """Remove the attached QR invoice from a recurring charge."""
+    rec = one(db, "SELECT * FROM recurring WHERE id=?", (recurring_id,), "Recurring charge")
+    if not rec["invoice_file"]:
+        raise HTTPException(404, "This recurring charge has no invoice attached")
+    dbm.delete_file(rec["invoice_file"])
+    update_row(db, "recurring", recurring_id, {"invoice_file": None, "invoice_filename": None,
+                                               "invoice_content_type": None})
+    return {"removed": recurring_id}
 
 
 @router.post("/recurring/{recurring_id}/pay", status_code=201, tags=["recurring"])
@@ -850,6 +920,67 @@ def get_fx_rate(currency: str = Query("GBP", pattern=CUR), date: Optional[str] =
     """The rate the app would use to convert `currency` to CHF on `date` (default today)."""
     d = date or _date.today().isoformat()
     return {"currency": currency, "date": d, "rate": resolve_rate(db, currency, d)}
+
+
+class ReapplyIn(BaseModel):
+    currency: str = Field("GBP", pattern=CUR)
+    month: Optional[str] = Field(None, pattern=MONTH, description="Month whose expenses are re-converted; "
+                                                                  "default current month")
+    fx_rate: Optional[float] = Field(None, gt=0, description="CHF per 1 unit; default is today's live rate")
+
+
+@router.post("/fx/reapply", tags=["fx"])
+def reapply_rate(body: ReapplyIn = ReapplyIn()):
+    """Get today's exchange rate and re-convert every expense of a month in that currency with it.
+
+    For months worked out before the money was actually paid: the CHF values then follow the
+    current rate instead of the rate of each booking date. Rate used, in order: `fx_rate` you pass →
+    a rate set by hand for today → the live rate (fetched now and stored) → the latest stored rate.
+    If the month has a "UK expenses" summary line it is recalculated too, keeping its fee percentage.
+    Other months are not touched.
+    """
+    if body.currency == BASE:
+        raise HTTPException(422, "Choose a foreign currency; CHF expenses need no conversion")
+    month, today = body.month or this_month(), _date.today().isoformat()
+    rate, source, fetched = body.fx_rate, "given", None
+    if rate is None:
+        with dbm.session() as db:
+            manual = db.execute("SELECT rate FROM fx_rates WHERE currency=? AND date=? AND source='manual'",
+                                (body.currency, today)).fetchone()
+        if manual:
+            rate, source = manual["rate"], "set by hand for today"
+        elif fxm.AUTO_FETCH:
+            fetched = fxm._fetch_rate(body.currency, today)        # network call, made without holding the database
+            if fetched:
+                rate, source = fetched, "live"
+    with dbm.session() as db:
+        if fetched:
+            db.execute("INSERT INTO fx_rates (currency, date, rate, source) VALUES (?,?,?,'auto') "
+                       "ON CONFLICT(currency, date) DO UPDATE SET rate=excluded.rate WHERE fx_rates.source='auto'",
+                       (body.currency, today, fetched))
+        if rate is None:
+            rate, source = resolve_rate(db, body.currency, today), "latest stored (live rate unavailable)"
+        txs = rows(db.execute("SELECT id, amount, amount_chf FROM transactions WHERE currency=? AND substr(date,1,7)=?",
+                              (body.currency, month)))
+        db.executemany("UPDATE transactions SET fx_rate=?, amount_chf=? WHERE id=?",
+                       [(rate, round(t["amount"] * rate, 2), t["id"]) for t in txs])
+        line = None
+        for line_id in rollup_state(db, month, body.currency)["line_ids"]:
+            old = one(db, "SELECT * FROM transactions WHERE id=?", (line_id,))
+            fee = re.search(r"\+ ([\d.]+)% transfer fees", old["note"] or "")
+            fee_pct = float(fee.group(1)) if fee else DEFAULT_TRANSFER_FEE_PCT
+            inside = db.execute("SELECT COALESCE(SUM(amount),0) AS total, COUNT(*) AS n FROM transactions "
+                                "WHERE rollup_id=?", (line_id,)).fetchone()
+            chf = rollup_chf(inside["total"], rate, fee_pct)
+            db.execute("UPDATE transactions SET amount=?, amount_chf=?, note=? WHERE id=?",
+                       (chf, chf, rollup_note(body.currency, inside["total"], rate, fee_pct, inside["n"], today),
+                        line_id))
+            line = {"id": line_id, "before_chf": old["amount_chf"], "after_chf": chf, "fee_pct": fee_pct}
+        return {"currency": body.currency, "month": month, "rate": rate, "rate_date": today, "source": source,
+                "updated_transactions": len(txs),
+                "before_chf": r2(sum(t["amount_chf"] for t in txs)),
+                "after_chf": r2(sum(round(t["amount"] * rate, 2) for t in txs)),
+                "summary_line": line}
 
 
 # ---------------------------------------------------------------- investments
@@ -1046,6 +1177,26 @@ def month_totals(db, month: str) -> dict:
             "savings_rate_pct": round((inc - exp) / inc * 100, 1) if inc > 0 else None}
 
 
+def foreign_transfer(db, month: str, rec: dict, currency: str = "GBP") -> dict:
+    """What has to be sent abroad for a month: charges in the currency, plus recurring charges in it
+    that are not paid yet, minus money received in it (rent, refunds)."""
+    r = db.execute(
+        "SELECT COALESCE(SUM(CASE WHEN amount>0 THEN amount END),0) AS charges, "
+        "COALESCE(-SUM(CASE WHEN amount<0 THEN amount END),0) AS received, "
+        "COALESCE(SUM(amount_chf),0) AS chf FROM transactions WHERE currency=? AND substr(date,1,7)=?",
+        (currency, month)).fetchone()
+    unpaid = [i for i in rec["items"] if i["currency"] == currency and not i["paid"]]
+    unpaid_amt = sum(i["expected_amount"] for i in unpaid)
+    net = r["charges"] - r["received"] + unpaid_amt
+    net_chf = r["chf"] + sum(i["expected_chf"] or 0 for i in unpaid)
+    return {"currency": currency, "charges": r2(r["charges"]), "received": r2(r["received"]),
+            "unpaid_recurring": r2(unpaid_amt), "unpaid_recurring_names": [i["name"] for i in unpaid],
+            "to_send": r2(net), "to_send_chf": r2(net_chf),
+            "explanation": "to_send = charges + recurring charges not yet paid - money received, all in "
+                           f"{currency}. Negative means more came in than went out. to_send_chf uses the CHF "
+                           "value stored on each row (POST /fx/reapply brings those to today's rate)."}
+
+
 @router.get("/reports/monthly", tags=["reports"])
 def monthly_report(month: Optional[str] = Query(None, pattern=MONTH), db=DB):
     """Everything needed to close a month in one call: income per person, spending per category vs budget,
@@ -1080,6 +1231,7 @@ def monthly_report(month: Optional[str] = Query(None, pattern=MONTH), db=DB):
                      "recurring_chf": r2(rec_counted), "variable_chf": r2(totals["expenses_chf"] - rec_counted),
                      "by_category": budgets, "foreign_currency": foreign},
         "recurring": rec,
+        "uk_transfer": foreign_transfer(db, month, rec),
         "budgets": {"over_budget": [b["category"] for b in budgets if b["over_budget"]],
                     "total_budget_chf": r2(sum(b["budget_chf"] or 0 for b in budgets))},
         "savings": {

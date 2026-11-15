@@ -29,12 +29,20 @@ Use `127.0.0.1` rather than `localhost` when calling from the same Windows machi
   `FX_AUTO_FETCH=false`. A rate set with `PUT /api/fx` for a day is never overwritten.
 - **"UK expenses" line.** `POST /transactions/rollup` pulls a month's GBP expenses into one CHF
   expense: GBP total × today's rate × 1.10 (10 % for Wise transfer fees; override with `fee_pct` /
-  `fx_rate`). The GBP rows then carry `rollup_id` and stop counting towards CHF totals, budgets and
+  `fx_rate`; no fee is added when the GBP total is negative). The GBP rows then carry `rollup_id` and stop counting towards CHF totals, budgets and
   category reports — the single line (category *UK expenses*) counts instead. They still appear in
   `/reports/foreign` and `expenses.foreign_currency`. Calling it again replaces the line; deleting
   the line restores the individual rows. Only do this when the humans ask for it.
 - **Dates** are `YYYY-MM-DD`; **months** are `YYYY-MM`. A transaction belongs to the month of its `date`.
-- **Expense sign:** positive `amount` = money spent; negative = refund.
+- **Expense sign:** positive `amount` = money spent; negative = money received. Rent from the UK
+  house is recorded this way: `{"description": "Rent received", "amount": -800, "currency": "GBP"}`.
+  It reduces the month's spending and what has to be sent to the UK. (Salaries still go to `/income`.)
+- **Needs to be sent to the UK.** `GET /reports/monthly` → `uk_transfer`: `to_send` (GBP) and
+  `to_send_chf` = GBP charges + GBP recurring charges not yet paid − GBP money received. A negative
+  value is a surplus in the UK. Report both figures to the humans.
+- **Re-apply today's rate.** When a month is worked out before the money is actually paid, call
+  `POST /fx/reapply {"month": "2026-10"}`: it fetches today's GBP rate and re-converts every GBP
+  expense of that month (and the "UK expenses" line, if there is one). Other months are untouched.
 - **Names instead of ids.** Wherever `category_id` or `person_id` is accepted you may send
   `category` / `person` with the name (case-insensitive). Unknown names return `422` listing the valid ones.
 - **Errors:** `404` unknown id, `409` conflict (duplicate name, already paid), `422` invalid input —
@@ -74,6 +82,7 @@ Run this once a month for the month that just ended (example: `2026-10`).
    - `expenses.total_chf`, `expenses.by_category` (with `budget_chf`, `remaining_chf`, `over_budget`)
    - `recurring.items` (each charge: `paid`, `paid_amount`, `difference`) and `recurring.unpaid`
    - `expenses.foreign_currency` (GBP total and its CHF value)
+   - `uk_transfer.to_send` / `to_send_chf` (what has to be sent to the UK, in GBP and CHF)
    - `savings.available_to_save_chf` = income − recorded expenses − recurring charges not yet paid
    - `savings.already_transferred_chf` and `savings.remaining_to_transfer_chf`
 9. **Report to the humans**: what each recurring charge cost, which budgets were over/under,
@@ -155,6 +164,17 @@ curl -F "file=@oct.png" -F "month=2026-10" http://127.0.0.1:1311/api/statements
 | DELETE | `/recurring/{id}` | | Delete the definition (past payments stay) |
 | GET | `/recurring/status` | `?month=` | Paid / unpaid per charge, totals |
 | POST | `/recurring/{id}/pay` | `month?`, `date?`, `amount?`, `fx_rate?`, `statement_id?`, `note?` | Mark paid (creates the transaction). `409` if already paid that month |
+| PUT | `/recurring/{id}/invoice` | multipart: `file` (image or PDF, ≤25 MB) | Attach the charge's Swiss QR invoice (replaces an earlier one) |
+| GET | `/recurring/{id}/invoice` | | The attached QR invoice file (`404` if none) |
+| DELETE | `/recurring/{id}/invoice` | | Remove the attached QR invoice |
+
+Each recurring charge can carry one QR invoice (the Swiss payment slip) so the humans can open it and
+scan it with their banking app. `GET /recurring` shows `invoice_filename` when one is attached and
+`/recurring/status` has `has_invoice`. The app stores the file as it is and does not read the QR code.
+
+```bash
+curl -X PUT -F "file=@qr-rechnung.png" http://127.0.0.1:1311/api/recurring/3/invoice
+```
 
 If the amount of a charge changes permanently (rent increase), `PATCH` the definition as well.
 
@@ -164,6 +184,7 @@ If the amount of a charge changes permanently (rent increase), `PATCH` the defin
 | GET | `/fx` | `?currency=GBP` | Stored rates |
 | PUT | `/fx` | `currency`, `date`, `rate` (CHF per 1 unit) | Store a rate |
 | GET | `/fx/rate` | `?currency=GBP&date=` | The rate the app would use |
+| POST | `/fx/reapply` | `currency?` (GBP), `month?` (default current), `fx_rate?` (default today's live rate) | Re-convert that month's expenses in the currency at today's rate; returns the rate, its source, and CHF before/after |
 
 ### Investments
 Account `type`: `cash`, `savings`, `stocks`, `pension`, `crypto`, `property`, `other`.
