@@ -179,8 +179,21 @@ function ukBox(u) {
   return kpi(surplus ? 'Surplus in the UK' : 'Needs to be sent to the UK', `<small>GBP</small>${nf.format(Math.abs(u.to_send))}`,
     `<b style="color:var(--ink);font-size:14px">= ${money(Math.abs(u.to_send_chf))}</b><br>${parts.join(' ')}`, surplus ? 'pos' : '');
 }
+/** Show a recurring charge's QR invoice large enough to scan from the screen. */
+function showInvoice(id, title, type, manage) {
+  const key = localStorage.getItem('apiKey');
+  const url = `/api/recurring/${id}/invoice${key ? `?api_key=${encodeURIComponent(key)}` : ''}`;
+  const dlg = $('#dlg'), form = $('#dlgform');
+  if (dlg.open) dlg.close();
+  form.innerHTML = `<h2>QR invoice · ${esc(title)}</h2>
+    ${(type || '').startsWith('image/') ? `<img class="qr" src="${url}" alt="QR invoice for ${esc(title)}">` : `<iframe class="qr" src="${url}" title="QR invoice for ${esc(title)}"></iframe>`}
+    <div class="row">${manage ? btn('remove-qr', 'Remove', id, 'ghost danger') + btn('attach', 'Replace', id, '') : '<a class="btn" href="#/recurring" id="qrmanage">Manage on Recurring</a>'}<a class="btn" href="${url}" target="_blank">Open in new tab</a><button class="primary" type="submit">Close</button></div>`;
+  form.onsubmit = (e) => { e.preventDefault(); dlg.close(); };
+  if ($('#qrmanage')) $('#qrmanage').onclick = () => dlg.close();
+  dlg.classList.add('wide'); dlg.showModal();
+}
 function txRows(list, showCur) {
-  return list.map((t) => `<tr><td>${t.date}</td><td>${esc(t.description)}${t.recurring ? ' <span class="tag">recurring</span>' : ''}${t.amount < 0 ? ' <span class="tag ok">money in</span>' : ''}${t.is_rollup ? ' <span class="tag ok">pulled from GBP</span>' : ''}${t.rollup_id ? ' <span class="tag">in UK expenses</span>' : ''}${t.note ? `<div class="sub" style="color:var(--muted);font-size:12px">${esc(t.note)}</div>` : ''}</td>
+  return list.map((t) => `<tr><td>${t.date}</td><td>${esc(t.description)}${t.recurring ? ' <span class="tag">recurring</span>' : ''}${t.recurring_invoice_type ? ' ' + btn('qr', 'QR invoice', t.recurring_id) : ''}${t.amount < 0 ? ' <span class="tag ok">money in</span>' : ''}${t.is_rollup ? ' <span class="tag ok">pulled from GBP</span>' : ''}${t.rollup_id ? ' <span class="tag">in UK expenses</span>' : ''}${t.note ? `<div class="sub" style="color:var(--muted);font-size:12px">${esc(t.note)}</div>` : ''}</td>
     <td>${t.category ? `<span class="tag">${esc(t.category)}</span>` : '<span class="tag bad">uncategorised</span>'}</td>
     ${showCur ? `<td class="num">${signed(t.amount, t.currency + ' ')}</td>` : ''}
     <td class="num">${t.currency !== 'CHF' && !showCur ? `<span class="tag">${money(Math.abs(t.amount), t.currency)}</span> ` : ''}${signed(t.amount_chf)}</td>
@@ -303,6 +316,9 @@ pages.expenses = async () => {
       ${card('Spending by category', '<div class="chart"><canvas id="c1"></canvas></div>', '', 'Last 12 months, CHF')}
       ${card('This month by category', meters(rep.expenses.by_category), '', monthLabel(m, true))}
     </div>
+    ${rep.recurring.items.length ? card('Recurring charges', table(['Charge', '#Amount', 'Status', ''], rep.recurring.items.map((r) => `<tr><td>${esc(r.name)}</td><td class="num">${money(r.paid ? r.paid_amount : r.expected_amount, r.currency)}</td>
+      <td>${r.paid ? `<span class="tag ok">✓ paid ${r.paid_date}</span>` : '<span class="tag bad">○ not paid</span>'}</td>
+      <td class="actions">${r.has_invoice ? btn('qr', 'QR invoice', r.recurring_id) : ''}</td></tr>`)), '<a href="#/recurring">Manage →</a>', `${monthLabel(m, true)} — open a QR invoice to scan and pay`) + '<div style="height:14px"></div>' : ''}
     ${card(`Expenses in ${monthLabel(m, true)}`, '<div id="txtable"></div>', `
       <input type="search" id="fq" placeholder="Search…" value="${esc(f.q)}">
       <select id="fcur" aria-label="Currency"><option value="">All currencies</option><option value="CHF">CHF only</option><option value="GBP">GBP only</option>${txs.some((t) => !['CHF', 'GBP'].includes(t.currency)) ? '<option value="other">Other currencies</option>' : ''}</select>
@@ -333,6 +349,10 @@ pages.expenses = async () => {
       const r = await api('/fx/reapply', { method: 'POST', json: { currency: 'GBP', month: m } });
       toast(r.updated_transactions ? `GBP rate ${r.rate.toFixed(4)} (${r.source}) applied to ${r.updated_transactions} expenses: ${money(r.before_chf)} → ${money(r.after_chf)}` : `No GBP expenses in ${monthLabel(m, true)}. Today's rate: ${r.rate.toFixed(4)}`);
       render();
+    },
+    qr: (id) => {
+      const r = rep.recurring.items.find((x) => x.recurring_id == id), t = txs.find((x) => x.recurring_id == id);
+      showInvoice(id, r ? `${r.name} · ${money(r.expected_amount, r.currency)}` : t.recurring, r ? r.invoice_content_type : t.recurring_invoice_type, false);
     },
     'pull-uk': async () => {
       const p = await api(`/transactions/rollup?month=${m}&currency=GBP`);
@@ -387,17 +407,7 @@ pages.recurring = async () => {
       if (!confirm('Remove the QR invoice from this charge?')) return;
       await api(`/recurring/${id}/invoice`, { method: 'DELETE' }); $('#dlg').close(); toast('Removed'); render();
     },
-    qr: (id) => {
-      const r = defs.find((x) => x.id == id), key = localStorage.getItem('apiKey');
-      const url = `/api/recurring/${id}/invoice${key ? `?api_key=${encodeURIComponent(key)}` : ''}`;
-      const isImage = (r.invoice_content_type || '').startsWith('image/');
-      const dlg = $('#dlg'), form = $('#dlgform');
-      form.innerHTML = `<h2>QR invoice · ${esc(r.name)} · ${money(r.amount, r.currency)}</h2>
-        ${isImage ? `<img class="qr" src="${url}" alt="QR invoice for ${esc(r.name)}">` : `<iframe class="qr" src="${url}" title="QR invoice for ${esc(r.name)}"></iframe>`}
-        <div class="row">${btn('remove-qr', 'Remove', id, 'ghost danger')}${btn('attach', 'Replace', id, '')}<a class="btn" href="${url}" target="_blank">Open in new tab</a><button class="primary" type="submit">Close</button></div>`;
-      form.onsubmit = (e) => { e.preventDefault(); dlg.close(); };
-      dlg.classList.add('wide'); dlg.showModal();
-    },
+    qr: (id) => { const r = defs.find((x) => x.id == id); showInvoice(id, `${r.name} · ${money(r.amount, r.currency)}`, r.invoice_content_type, true); },
     pay: (id) => {
       const r = st.items.find((x) => x.recurring_id == id);
       openForm(`Mark "${r.name}" as paid`, [

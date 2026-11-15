@@ -503,6 +503,7 @@ class BulkIn(BaseModel):
 
 
 TX_SELECT = ("SELECT t.*, c.name AS category, p.name AS person, r.name AS recurring, "
+             "r.invoice_content_type AS recurring_invoice_type, "     # set when the charge has a QR invoice
              "EXISTS(SELECT 1 FROM transactions x WHERE x.rollup_id=t.id) AS is_rollup FROM transactions t "
              "LEFT JOIN categories c ON c.id=t.category_id LEFT JOIN people p ON p.id=t.person_id "
              "LEFT JOIN recurring r ON r.id=t.recurring_id")
