@@ -745,12 +745,15 @@ class PayIn(BaseModel):
 
 
 REC_SELECT = "SELECT r.*, c.name AS category FROM recurring r LEFT JOIN categories c ON c.id=r.category_id"
+# recurring charges are listed CHF first, then GBP, then any other currency
+REC_CURRENCY_ORDER = "CASE r.currency WHEN 'CHF' THEN 0 WHEN 'GBP' THEN 1 ELSE 2 END, r.currency"
 
 
 def recurring_status(db, month: str) -> dict:
     recs = rows(db.execute(
         f"{REC_SELECT} WHERE r.active=1 AND (r.start_month IS NULL OR r.start_month<=?) "
-        "AND (r.end_month IS NULL OR r.end_month>=?) ORDER BY r.day_of_month IS NULL, r.day_of_month, r.name",
+        f"AND (r.end_month IS NULL OR r.end_month>=?) ORDER BY {REC_CURRENCY_ORDER}, "
+        "r.day_of_month IS NULL, r.day_of_month, r.name",
         (month, month)))
     paid = {r["recurring_id"]: r for r in db.execute(
         "SELECT recurring_id, SUM(amount) AS amount, SUM(amount_chf) AS chf, MAX(date) AS date, COUNT(*) AS n "
@@ -779,7 +782,7 @@ def recurring_status(db, month: str) -> dict:
 @router.get("/recurring", tags=["recurring"])
 def list_recurring(db=DB):
     """All standing monthly charges (rent, car payment, ...), including inactive ones."""
-    return rows(db.execute(f"{REC_SELECT} ORDER BY r.active DESC, r.name"))
+    return rows(db.execute(f"{REC_SELECT} ORDER BY r.active DESC, {REC_CURRENCY_ORDER}, r.name"))
 
 
 @router.post("/recurring", status_code=201, tags=["recurring"])
